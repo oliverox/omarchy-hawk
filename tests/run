@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# tests/run — runs bin/hawk-status against a local mock of both APIs.
+set -uo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT="$HERE/../bin/hawk-status"
+PASS=0; FAIL=0
+ok()   { PASS=$((PASS + 1)); echo "  PASS: $1"; }
+fail() { FAIL=$((FAIL + 1)); echo "  FAIL: $1 — $2"; }
+assert_eq() { [ "$2" = "$3" ] && ok "$1" || fail "$1" "expected '$2', got '$3'"; }
+assert_true() { [ "$2" = "true" ] && ok "$1" || fail "$1" "got '$2'"; }
+
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/hawk-status-test.XXXXXX")"
+trap 'rm -rf "$WORK"; [ -n "${MOCK_PID:-}" ] && kill "$MOCK_PID" 2>/dev/null' EXIT
+export XDG_CACHE_HOME="$WORK/cache" XDG_CONFIG_HOME="$WORK/config"
+export REQUEST_LOG="$WORK/requests.log"
+FIX="$WORK/fixtures"; mkdir -p "$FIX"
+export FIXTURE_DIR="$FIX"
+
+# ── fixtures ──────────────────────────────────────────────────────────────────
+NOW_S=$(date -u +%s)
+TODAY=$(date -u +%F)
+day() { date -u -d "@$((NOW_S - $1 * 86400))" +%F; }
+MIDNIGHT_MS=$(( $(date -u -d "$TODAY 00:00:00" +%s) * 1000 ))
+NOW_MS=$(( NOW_S * 1000 ))
+
+cat > "$FIX/vaults_getVaultPublicView.json" <<JSON
+{"slug":"hawk-2","label":"Hawk","leverage":3,"live":true,
+ "performance":{"accountValue":500,"realizedPnl":100.5,"cycles":300,"activeCoins":8,"paused":false,
+   "updatedAt":$(( NOW_MS - 30000 )),"returnPct":1.5,"daysRunning":10,"totalDeposits":457},
+ "policy":{"hlDepositAddress":"0x39818a5cb22fd269cd73f0c0480c439d76493692","feeBps":1000,"lockPeriodDays":0,"openForDeposits":true,"minDepositUsdc":1},
+ "depositorStats":{"count":1,"totalShares":1000,"navPerShare":0.5,"operatorShares":500,"operatorSharePct":0.5}}
+JSON
+cat > "$FIX/clearinghouseState.json" <<'JSON'
+{"marginSummary":{"accountValue":"1234.5","totalMarginUsed":"123.45"},"withdrawable":"900.25",
+ "assetPositions":[
+  {"position":{"coin":"ZRO","szi":"46.8","entryPx":"1.04","positionValue":"49.4","unrealizedPnl":"0.6458","returnOnEquity":"0.039"}},
+  {"position":{"coin":"OLD","szi":"0","entryPx":"1","positionValue":"0","unrealizedPnl":"0","returnOnEquity":"0"}},
+  {"position":{"coin":"FIL","szi":"61.4","entryPx":"0.79","positionValue":"48.7","unrealizedPnl":"-0.18","returnOnEquity":"-0.011"}}]}
+JSON
+# Daily rows: the vault's numbers; the script halves them (sharePct 0.5).
+cat > "$FIX/dailyPnlQuery_listDailyRealized.json" <<JSON
+[{"day":"$(day 40)","realized":20,"fees":0,"netRealized":20,"cycleCount":4,"fillCount":8},
+ {"day":"$(day 8)","realized":-10,"fees":0,"netRealized":-10,"cycleCount":1,"fillCount":2},
+ {"day":"$(day 7)","realized":100,"fees":0,"netRealized":100,"cycleCount":9,"fillCount":20},
+ {"day":"$(day 6)","realized":6,"fees":0,"netRealized":6,"cycleCount":2,"fillCount":4},
+ {"day":"$(day 2)","realized":8,"fees":0,"netRealized":8,"cycleCount":2,"fillCount":4},
+ {"day":"$(day 1)","realized":-4,"fees":0,"netRealized":-4,"cycleCount":1,"fillCount":3},
+ {"day":"$(day 0)","realized":2.5,"fees":0.1,"netRealized":2.4,"cycleCount":1,"fillCount":2},
+ {"day":"$(day 3)","realized":0,"fees":0,"netRealized":0,"cycleCount":0,"fillCount":0}]
+JSON
+cat > "$FIX/vaults_getNavSeries.json" <<JSON
+[{"capturedAt":$(( NOW_MS - 7200000 )),"navPerShare":0.5},
+ {"capturedAt":$(( NOW_MS - 3600000 )),"navPerShare":0.6},
+ {"capturedAt":$NOW_MS,"navPerShare":0.55}]
+JSON
+# Fills: two yesterday (before midnight), three today. closedPnl - fee.
+cat > "$FIX/fills.json" <<JSON
+[{"tid":1,"oid":11,"coin":"ZEN","time":$(( MIDNIGHT_MS - 7200000 )),"px":"5.5","sz":"1","closedPnl":"1.0","fee":"0.1"},
+ {"tid":2,"oid":11,"coin":"ZEN","time":$(( MIDNIGHT_MS - 7100000 )),"px":"5.5","sz":"1","closedPnl":"1.0","fee":"0.1"},
+ {"tid":3,"oid":21,"coin":"JUP","time":$(( MIDNIGHT_MS + 1000 )),"px":"0.2","sz":"100","closedPnl":"0","fee":"0.05"},
+ {"tid":4,"oid":22,"coin":"JUP","time":$(( MIDNIGHT_MS + 60000 )),"px":"0.22","sz":"50","closedPnl":"1.0","fee":"0.02"},
+ {"tid":5,"oid":22,"coin":"JUP","time":$(( MIDNIGHT_MS + 61000 )),"px":"0.22","sz":"50","closedPnl":"1.0","fee":"0.02"}]
+JSON
+
+# ── mock server ───────────────────────────────────────────────────────────────
+python3 "$HERE/mock_api.py" > "$WORK/port" 2>"$WORK/mock.err" &
+MOCK_PID=$!
+for _ in $(seq 1 50); do [ -s "$WORK/port" ] && break; sleep 0.1; done
+PORT=$(head -1 "$WORK/port")
+[ -n "$PORT" ] || { echo "mock server did not start"; cat "$WORK/mock.err"; exit 1; }
+export HAWK_CONVEX_BASE="http://127.0.0.1:$PORT" HAWK_HL_BASE="http://127.0.0.1:$PORT"
+
+echo "--- status"
+S=$("$SCRIPT" status)
+assert_eq "status: ok with wallet from the policy" "0x39818a5cb22fd269cd73f0c0480c439d76493692" "$(jq -r .wallet <<<"$S")"
+
+echo "--- summary: shape and formatting"
+: > "$REQUEST_LOG"
+SUM=$("$SCRIPT" summary)
+assert_true "summary: ok" "$(jq -r .ok <<<"$SUM")"
+assert_eq "summary: no errors" "[]" "$(jq -c .errors <<<"$SUM")"
+assert_eq "summary: account value from Hyperliquid, not the vault view" "1234.5" "$(jq -r .account.value <<<"$SUM")"
+assert_eq "summary: whole-dollar text has thousands separator" "\$1,235" "$(jq -r .account.valueWhole <<<"$SUM")"
+assert_eq "summary: margin pct one decimal" "10" "$(jq -r .account.marginPct <<<"$SUM")"
+assert_eq "summary: free is withdrawable" "900.25" "$(jq -r .account.free <<<"$SUM")"
+assert_eq "summary: zero-size positions dropped, sorted by value" "ZRO,FIL" "$(jq -r '[.account.positions[].coin] | join(",")' <<<"$SUM")"
+assert_eq "summary: today live = closedPnl - fee over today's fills" "1.91" "$(jq -r '.today.live | . * 100 | round / 100' <<<"$SUM")"
+assert_eq "summary: today live text" "+\$1.91" "$(jq -r .today.liveText <<<"$SUM")"
+assert_eq "summary: bar text" "\$1,235 +\$1.91" "$(jq -r .barText <<<"$SUM")"
+assert_eq "summary: share pct text" "50%" "$(jq -r .vault.sharePctText <<<"$SUM")"
+assert_eq "summary: sync not stale at 30s" "false" "$(jq -r .vault.stale <<<"$SUM")"
+assert_eq "summary: first look never announces old fills" "[]" "$(jq -c .newExits <<<"$SUM")"
+
+echo "--- daily roll-ups (console semantics, scaled by share)"
+W=$(jq -c .daily.windows <<<"$SUM")
+assert_eq "today = row × share" "1.2" "$(jq -r .today <<<"$W")"
+assert_eq "yesterday" "-2" "$(jq -r .yesterday <<<"$W")"
+assert_eq "day before" "4" "$(jq -r .dayBefore <<<"$W")"
+# last7 = rows with day > (today-7): days 6,3,2,1,0 → (6+0+8-4+2.4)/2 = 6.2; the 7-day-old row is excluded.
+assert_eq "last 7d excludes the day exactly 7 days back" "6.2" "$(jq -r .last7 <<<"$W")"
+# last15 adds days 7 and 8: 6.2 + (100-10)/2 = 51.2
+assert_eq "last 15d" "51.2" "$(jq -r .last15 <<<"$W")"
+assert_eq "last 30d excludes the 40-day-old row" "51.2" "$(jq -r .last30 <<<"$W")"
+assert_eq "signed text" "+\$6.20" "$(jq -r .last7Text <<<"$W")"
+R=$(jq -c .daily.record <<<"$SUM")
+assert_eq "record: wins count positive days only" "5" "$(jq -r .wins <<<"$R")"
+assert_eq "record: losses" "2" "$(jq -r .losses <<<"$R")"
+assert_eq "record: win rate rounds" "71" "$(jq -r .winRate <<<"$R")"
+assert_eq "record: gain sum" "68.2" "$(jq -r .gain <<<"$R")"
+assert_eq "record: loss sum" "-7" "$(jq -r .loss <<<"$R")"
+assert_eq "daily: maxAbs for the color scale" "50" "$(jq -r .daily.maxAbs <<<"$SUM")"
+assert_eq "daily: todayKey" "$TODAY" "$(jq -r .daily.todayKey <<<"$SUM")"
+assert_eq "daily: rows sorted ascending" "$(day 40)" "$(jq -r '.daily.rows[0].day' <<<"$SUM")"
+
+echo "--- new exits on the second look"
+# Add a fresh closing fill after the remembered cursor: two chunks of one order.
+LAST=$(jq -r .latest "$XDG_CACHE_HOME/omarchy-hawk/fills-seen.json")
+jq --argjson t "$((LAST + 5000))" '. + [
+  {"tid":6,"oid":33,"coin":"ZRO","time":$t,"px":"1.10","sz":"20","closedPnl":"0.8","fee":"0.05"},
+  {"tid":7,"oid":33,"coin":"ZRO","time":($t+1),"px":"1.10","sz":"26.8","closedPnl":"1.0","fee":"0.05"},
+  {"tid":8,"oid":34,"coin":"FIL","time":($t+2),"px":"0.80","sz":"10","closedPnl":"0","fee":"0.01"}]' \
+  "$FIX/fills.json" > "$FIX/fills.tmp" && mv "$FIX/fills.tmp" "$FIX/fills.json"
+SUM2=$("$SCRIPT" summary)
+assert_eq "exits: one order = one toast, chunks summed net of fees" "1" "$(jq -r '.newExits | length' <<<"$SUM2")"
+assert_eq "exits: coin" "ZRO" "$(jq -r '.newExits[0].coin' <<<"$SUM2")"
+assert_eq "exits: pnl text" "+\$1.70" "$(jq -r '.newExits[0].pnlText' <<<"$SUM2")"
+assert_eq "exits: an opening fill (closedPnl 0) is not an exit" "0" "$(jq -r '[.newExits[] | select(.coin=="FIL")] | length' <<<"$SUM2")"
+SUM3=$("$SCRIPT" summary)
+assert_eq "exits: announced once" "[]" "$(jq -c .newExits <<<"$SUM3")"
+
+echo "--- fill pagination"
+# 2000 fills today at distinct times, then 5 more: a bare page would stop at 2000.
+python3 - "$FIX/fills.json" "$MIDNIGHT_MS" <<'PY'
+import json, sys
+path, mid = sys.argv[1], int(sys.argv[2])
+fills = [{"tid": 1000 + i, "oid": 5000 + i, "coin": "PAG", "time": mid + 10 + i,
+          "px": "1", "sz": "1", "closedPnl": "0.01", "fee": "0"} for i in range(2005)]
+json.dump(fills, open(path, "w"))
+PY
+rm -f "$XDG_CACHE_HOME/omarchy-hawk/fills-seen.json"
+: > "$REQUEST_LOG"
+SUM4=$("$SCRIPT" summary)
+assert_eq "pagination: all 2005 fills counted" "2005" "$(jq -r .today.fills <<<"$SUM4")"
+assert_eq "pagination: walked two pages" "2" "$(grep -c userFillsByTime "$REQUEST_LOG")"
+assert_eq "pagination: live sum de-duplicated on tid" "20.05" "$(jq -r '.today.live | . * 100 | round / 100' <<<"$SUM4")"
+
+echo "--- nav"
+NAV=$("$SCRIPT" nav 7d)
+assert_true "nav: ok" "$(jq -r .ok <<<"$NAV")"
+assert_eq "nav: points scaled by shares" "250,300,275" "$(jq -r '[.points[].v | tostring] | join(",")' <<<"$NAV")"
+assert_eq "nav: min/max" "250/300" "$(jq -r '"\(.min)/\(.max)"' <<<"$NAV")"
+assert_eq "nav: current text" "\$275.00" "$(jq -r .currentText <<<"$NAV")"
+assert_eq "nav: hwm = 1.0 × shares by default" "500" "$(jq -r .hwm <<<"$NAV")"
+assert_eq "nav: HAWK_HWM override" "400" "$(HAWK_HWM=0.8 "$SCRIPT" nav 7d | jq -r .hwm)"
+assert_eq "nav: bad range refused" "false" "$("$SCRIPT" nav 3d | jq -r .ok)"
+
+echo "--- validation and failure"
+assert_eq "bad slug refused" "false" "$(HAWK_SLUG='x;rm' "$SCRIPT" status | jq -r .ok)"
+assert_eq "unknown command refused" "false" "$("$SCRIPT" bogus | jq -r .ok)"
+mv "$FIX/clearinghouseState.json" "$FIX/clearinghouseState.json.off"
+SUM5=$("$SCRIPT" summary)
+assert_true "hl down: summary still ok from the vault view" "$(jq -r .ok <<<"$SUM5")"
+assert_eq "hl down: account falls back to the vault's value" "500" "$(jq -r .account.value <<<"$SUM5")"
+assert_eq "hl down: error carried" "1" "$(jq -r '[.errors[] | select(startswith("Hyperliquid"))] | length' <<<"$SUM5")"
+mv "$FIX/clearinghouseState.json.off" "$FIX/clearinghouseState.json"
+
+echo "--- demo"
+"$SCRIPT" demo on >/dev/null
+D=$("$SCRIPT" summary)
+assert_true "demo: flagged" "$(jq -r .demo <<<"$D")"
+assert_eq "demo: same shape (windows present)" "true" "$(jq -r '.daily.windows | has("last30Text")' <<<"$D")"
+assert_eq "demo: nav count" "168" "$("$SCRIPT" nav 30d | jq -r .count)"
+"$SCRIPT" demo off >/dev/null
+assert_eq "demo: off again" "false" "$("$SCRIPT" status | jq -r .demo)"
+
+echo ""
+echo "Passed: $PASS  Failed: $FAIL"
+[ "$FAIL" -eq 0 ]

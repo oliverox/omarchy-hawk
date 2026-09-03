@@ -1,0 +1,480 @@
+#!/usr/bin/env bash
+
+# hawk-status: fetch what the Hawk console shows and print it as JSON for the
+# panel. All arithmetic on numbers that came over the network happens in jq,
+# never in bash, so a value that is not a number fails a parse instead of
+# being evaluated.
+#
+# Nothing here is a secret. The vault slug resolves, through a public Convex
+# query, to the agent wallet address; the wallet address feeds Hyperliquid's
+# public info API. No key, no login, no SSH.
+#
+# Commands:
+#   status           whether the vault answers, and demo state
+#   summary          header figures, positions, live "today", daily P&L
+#                    calendar, new closing fills since the last look
+#   nav <range>      position-value series: 1d 7d 15d 30d 60d 90d all
+#   demo on|off      invented data for screenshots; cache writes become no-ops
+#
+# Environment (all optional):
+#   HAWK_SLUG         vault slug, default hawk-2
+#   HAWK_WALLET       override the wallet the vault policy names
+#   HAWK_HWM          high-water mark per share for the chart line, default 1
+#   HAWK_DAYS         calendar days, default 70 (10 weeks)
+#   HAWK_CONVEX_BASE  Convex deployment URL (tests point it at a mock)
+#   HAWK_HL_BASE      Hyperliquid API URL (tests point it at a mock)
+
+set -uo pipefail
+
+SLUG="${HAWK_SLUG:-hawk-2}"
+CONVEX_BASE="${HAWK_CONVEX_BASE:-https://dependable-snake-898.convex.cloud}"
+HL_BASE="${HAWK_HL_BASE:-https://api.hyperliquid.xyz}"
+DAYS="${HAWK_DAYS:-70}"
+HWM="${HAWK_HWM:-1}"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-hawk"
+DEMO_FILE="$CONFIG_DIR/demo"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-hawk"
+SEEN_FILE="$CACHE_DIR/fills-seen.json"
+
+CURL_TIMEOUT=15
+MAX_RESPONSE_BYTES=4194304
+MAX_FILL_PAGES=10
+
+die() {
+  jq -n --arg error "$1" '{ok: false, error: $error}'
+  exit 0
+}
+
+command -v jq >/dev/null 2>&1 || {
+  printf '{"ok":false,"error":"jq is not installed"}\n'
+  exit 0
+}
+command -v curl >/dev/null 2>&1 || die "curl is not installed"
+
+# Only digits, dots and a leading minus may reach jq as numbers built here.
+valid_number() { [[ "$1" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; }
+valid_slug() { [[ "$1" =~ ^[a-z0-9-]{1,40}$ ]]; }
+valid_wallet() { [[ "$1" =~ ^0x[0-9a-fA-F]{40}$ ]]; }
+valid_range() { [[ "$1" =~ ^(1d|7d|15d|30d|60d|90d|all)$ ]]; }
+valid_slug "$SLUG" || die "HAWK_SLUG must be lowercase letters, digits and dashes"
+valid_number "$DAYS" || DAYS=70
+valid_number "$HWM" || HWM=1
+
+# --- private cache -----------------------------------------------------------
+
+private_dir() {
+  local dir="$1"
+  mkdir -p -m 700 -- "$dir" 2>/dev/null
+  [[ -d "$dir" && ! -L "$dir" ]] || return 1
+  [[ "$(stat -c '%u' -- "$dir" 2>/dev/null)" == "$(id -u)" ]] || return 1
+  chmod 700 -- "$dir" 2>/dev/null || return 1
+  return 0
+}
+
+write_private() {
+  local dest="$1" tmp
+  tmp="$(mktemp "$dest.XXXXXX" 2>/dev/null)" || return 1
+  chmod 600 -- "$tmp" 2>/dev/null
+  cat >"$tmp" || { rm -f -- "$tmp"; return 1; }
+  mv -f -- "$tmp" "$dest" || { rm -f -- "$tmp"; return 1; }
+}
+
+read_bounded_file() {
+  local file="$1" max="$2" blocks
+  blocks=$(( (max + 4095) / 4096 ))
+  dd if="$file" iflag=nofollow,nonblock bs=4096 count="$blocks" 2>/dev/null
+}
+
+demo_on() { [[ -f "$DEMO_FILE" && ! -L "$DEMO_FILE" ]]; }
+
+# --- talking to the two APIs -------------------------------------------------
+
+# One Convex query over its public HTTP API. Prints the `.value` on success;
+# on failure prints nothing and returns 1 with the reason on stderr-ish (a
+# global) so the caller can carry it in `errors`.
+fail_doc() { jq -nc --arg error "$1" '{ok: false, error: $error}'; return 1; }
+err_of() { jq -r '.error // "unknown error"' <<<"$1" 2>/dev/null; }
+convex_query() {
+  local path="$1" args="$2" body resp code
+  body="$(jq -nc --arg path "$path" --argjson args "$args" '{path: $path, args: $args, format: "json"}')"
+  resp="$(curl -sS --max-time "$CURL_TIMEOUT" -X POST "$CONVEX_BASE/api/query" \
+    -H "Content-Type: application/json" --data-binary "$body" -w '\n%{http_code}' 2>/dev/null |
+    head -c "$MAX_RESPONSE_BYTES")"
+  code="${resp##*$'\n'}"
+  resp="${resp%$'\n'*}"
+  [[ "$code" == "200" ]] || { fail_doc "Convex $path: HTTP ${code:-none}"; return 1; }
+  if [[ "$(jq -r '.status // ""' <<<"$resp" 2>/dev/null)" != "success" ]]; then
+    fail_doc "Convex $path: $(jq -r '.errorMessage // "bad answer"' <<<"$resp" 2>/dev/null | head -c 120)"
+    return 1
+  fi
+  jq -c '.value' <<<"$resp" 2>/dev/null || { fail_doc "Convex $path: unreadable"; return 1; }
+}
+
+hl_info() {
+  local body="$1" resp code
+  resp="$(curl -sS --max-time "$CURL_TIMEOUT" -X POST "$HL_BASE/info" \
+    -H "Content-Type: application/json" --data-binary "$body" -w '\n%{http_code}' 2>/dev/null |
+    head -c "$MAX_RESPONSE_BYTES")"
+  code="${resp##*$'\n'}"
+  resp="${resp%$'\n'*}"
+  [[ "$code" == "200" ]] || { fail_doc "Hyperliquid: HTTP ${code:-none}"; return 1; }
+  jq -e . >/dev/null 2>&1 <<<"$resp" || { fail_doc "Hyperliquid: unreadable answer"; return 1; }
+  printf '%s' "$resp"
+}
+
+# Every fill since $1 (epoch ms). Hyperliquid caps a page at 2000 fills, so
+# the request walks forward page by page from the anchor, overlapping on the
+# newest timestamp and de-duplicating on the trade id. Prints a JSON array.
+fills_since() {
+  local wallet="$1" start="$2" page n newest i dir
+  # Pages go through files, never through an exec argument: a 2000-fill page
+  # is ~250KB and a single argument tops out at 128KB on Linux.
+  dir="$(mktemp -d "${TMPDIR:-/tmp}/hawk-status-fills.XXXXXX")" || { printf '[]'; return 1; }
+  chmod 700 -- "$dir"
+  for i in $(seq -w 1 "$MAX_FILL_PAGES"); do
+    page="$(hl_info "$(jq -nc --arg u "$wallet" --argjson s "$start" \
+      '{type: "userFillsByTime", user: $u, startTime: $s}')")" || { rm -rf -- "$dir"; printf '%s' "$page"; return 1; }
+    jq -e 'type == "array"' >/dev/null 2>&1 <<<"$page" || { rm -rf -- "$dir"; fail_doc "Hyperliquid: fills unreadable"; return 1; }
+    printf '%s' "$page" > "$dir/p$i.json"
+    n="$(jq -r 'length' "$dir/p$i.json")"
+    [[ "$n" -ge 2000 ]] || break
+    newest="$(jq -r '[.[] | .time] | max // 0' "$dir/p$i.json")"
+    valid_number "$newest" || break
+    [[ "$newest" -gt "$start" ]] || break
+    start="$newest"
+  done
+  jq -cs 'add // [] | unique_by(.tid)' "$dir"/p*.json 2>/dev/null || printf '[]'
+  rm -rf -- "$dir"
+  return 0
+}
+
+utc_midnight_ms() {
+  local d
+  d="$(date -u +%F)"
+  printf '%s' "$(( $(date -u -d "$d 00:00:00" +%s) * 1000 ))"
+}
+
+# --- shaping -----------------------------------------------------------------
+
+# jq library shared by summary and demo: money formatting and the calendar
+# roll-ups, written once so the demo payload has the same shape as the real one.
+JQ_LIB='
+  def r2: (. * 100 | round) / 100;
+  def pad2: tostring | if length < 2 then "0" + . else . end;
+  def two: (. * 100 | round) as $c
+    | (($c / 100 | floor) | tostring) + "." + (($c % 100) | pad2);
+  def money: if . < 0 then "-$" + (-. | two) else "$" + two end;
+  def signed: if . < 0 then "-$" + (-. | two) else "+$" + two end;
+  def whole: (. | round) as $n | (if $n < 0 then "-$" else "$" end)
+    + (($n | if . < 0 then -. else . end | tostring) | . as $s
+       | [range(0; length)] | map($s[.:.+1])
+       | reduce .[] as $ch ({s: "", n: ($s | length)}; .n -= 1 | .s += $ch + (if .n > 0 and .n % 3 == 0 then "," else "" end)) | .s);
+  def compactSigned: (. * 10 | round) / 10 | if . < 0 then "-" + (-. | tostring) else "+" + tostring end;
+
+  # rows: [{day, netRealized, realized, fees, cycleCount, fillCount}] scaled.
+  def rollups($rows; $today; $y1; $y2; $c7; $c15; $c30):
+    ($rows | map({key: .day, value: .}) | from_entries) as $by
+    | { today: ($by[$today].netRealized // 0),
+        yesterday: ($by[$y1].netRealized // 0),
+        dayBefore: ($by[$y2].netRealized // 0),
+        last7: ([$rows[] | select(.day > $c7) | .netRealized] | add // 0),
+        last15: ([$rows[] | select(.day > $c15) | .netRealized] | add // 0),
+        last30: ([$rows[] | select(.day > $c30) | .netRealized] | add // 0) };
+  def record($rows):
+    ([$rows[] | select(.netRealized > 0)]) as $w
+    | ([$rows[] | select(.netRealized < 0)]) as $l
+    | { wins: ($w | length), losses: ($l | length),
+        gain: ($w | map(.netRealized) | add // 0),
+        loss: ($l | map(.netRealized) | add // 0),
+        winRate: (if (($w | length) + ($l | length)) > 0
+                  then ((($w | length) / (($w | length) + ($l | length))) * 100 | round) else null end) };
+  def withText:
+    . + { todayText: (.today | signed), yesterdayText: (.yesterday | signed),
+          dayBeforeText: (.dayBefore | signed), last7Text: (.last7 | signed),
+          last15Text: (.last15 | signed), last30Text: (.last30 | signed) };
+'
+
+day_keys() {
+  local now="$1"
+  jq -nc --argjson now "$now" '
+    def key($d): ($now - $d * 86400) | strftime("%Y-%m-%d");
+    {today: key(0), y1: key(1), y2: key(2), c7: key(7), c15: key(15), c30: key(30)}'
+}
+
+# --- summary -----------------------------------------------------------------
+
+cmd_summary() {
+  if demo_on; then demo_summary; return; fi
+
+  local errors="[]" now keys
+  now="$(date -u +%s)"
+  keys="$(day_keys "$now")"
+
+  # 1. Vault view: label, paused, shares, share fraction, and the wallet.
+  local vault="null" wallet="" sharePct="1" shares="0"
+  if vault="$(convex_query "vaults:getVaultPublicView" "$(jq -nc --arg s "$SLUG" '{slug: $s}')")"; then
+    [[ "$vault" != "null" ]] || { vault="null"; errors="$(jq -c '. + ["Vault slug not found"]' <<<"$errors")"; }
+  else
+    errors="$(jq -c --arg e "$(err_of "$vault")" '. + [$e]' <<<"$errors")"; vault="null"
+  fi
+  if [[ "$vault" != "null" ]]; then
+    wallet="$(jq -r '.policy.hlDepositAddress // ""' <<<"$vault")"
+    sharePct="$(jq -r '.depositorStats.operatorSharePct // 1' <<<"$vault")"
+    shares="$(jq -r '.depositorStats.operatorShares // 0' <<<"$vault")"
+  fi
+  [[ -n "${HAWK_WALLET:-}" ]] && wallet="$HAWK_WALLET"
+  valid_number "$sharePct" || sharePct=1
+  valid_number "$shares" || shares=0
+
+  # 2. Live account from Hyperliquid, keyed by the public wallet address.
+  local account="null" fills="[]" seen latest="0" newExits="[]"
+  if valid_wallet "$wallet"; then
+    if account="$(hl_info "$(jq -nc --arg u "$wallet" '{type: "clearinghouseState", user: $u}')")"; then
+      jq -e 'type == "object" and has("marginSummary")' >/dev/null 2>&1 <<<"$account" ||
+        { account="null"; errors="$(jq -c '. + ["Hyperliquid: state missing marginSummary"]' <<<"$errors")"; }
+    else
+      errors="$(jq -c --arg e "$(err_of "$account")" '. + [$e]' <<<"$errors")"; account="null"
+    fi
+
+    # Today's fills for the live figure, and anything newer than the last
+    # look for the toasts. One walk from the earlier of the two anchors.
+    seen="$(read_bounded_file "$SEEN_FILE" 4096 2>/dev/null)"
+    jq -e 'type == "object"' >/dev/null 2>&1 <<<"$seen" || seen='{}'
+    latest="$(jq -r '.latest // 0' <<<"$seen")"
+    valid_number "$latest" || latest=0
+    local midnight anchor
+    midnight="$(utc_midnight_ms)"
+    anchor="$midnight"
+    [[ "$latest" -gt 0 && "$latest" -lt "$midnight" ]] && anchor="$latest"
+    if fills="$(fills_since "$wallet" "$anchor")"; then
+      local newestFill
+      newestFill="$(jq -r '[.[] | .time] | max // 0' <<<"$fills")"
+      valid_number "$newestFill" || newestFill=0
+      # First look ever: remember where we are, toast nothing (installing
+      # the widget must not announce old money).
+      if [[ "$latest" -gt 0 ]]; then
+        newExits="$(jq -c --argjson since "$latest" "$JQ_LIB"'
+          [ .[] | select(.time > $since and ((.closedPnl // "0") | tonumber) != 0) ]
+          | group_by(.coin, .oid)
+          | map({ coin: .[0].coin,
+                  pnl: (map((.closedPnl | tonumber) - ((.fee // "0") | tonumber)) | add),
+                  px: (.[0].px | tonumber),
+                  time: (map(.time) | max) })
+          | sort_by(.time)
+          | map(. + {pnlText: (.pnl | signed), pxText: ("$" + (.px | tostring))})' <<<"$fills" 2>/dev/null || echo "[]")"
+      fi
+      if [[ "$newestFill" -gt "$latest" ]] && private_dir "$CACHE_DIR"; then
+        jq -nc --argjson latest "$newestFill" '{latest: $latest}' | write_private "$SEEN_FILE"
+      fi
+    else
+      errors="$(jq -c --arg e "$(err_of "$fills")" '. + [$e]' <<<"$errors")"; fills="[]"
+    fi
+  else
+    errors="$(jq -c '. + ["No wallet address: vault policy unavailable"]' <<<"$errors")"
+  fi
+
+  # 3. Daily rows, the same query the console's calendar reads.
+  local daily="null"
+  if daily="$(convex_query "dailyPnlQuery:listDailyRealized" "$(jq -nc --argjson d "$((DAYS + 5))" '{days: $d}')")"; then
+    jq -e 'type == "array"' >/dev/null 2>&1 <<<"$daily" || daily="null"
+  else
+    errors="$(jq -c --arg e "$(err_of "$daily")" '. + [$e]' <<<"$errors")"; daily="null"
+  fi
+
+  if [[ "$vault" == "null" && "$account" == "null" ]]; then
+    jq -nc --argjson errors "$errors" '{ok: false, error: ($errors | join("; "))}'
+    return
+  fi
+
+  local fillsfile
+  fillsfile="$(mktemp "${TMPDIR:-/tmp}/hawk-status-fills.XXXXXX")" || die "Could not make a working file"
+  printf '%s' "$fills" > "$fillsfile"
+  trap "rm -f -- '$fillsfile'" EXIT
+  jq -nc \
+    --argjson vault "$vault" \
+    --argjson account "$account" \
+    --slurpfile fillsdoc "$fillsfile" \
+    --argjson daily "$daily" \
+    --argjson newExits "$newExits" \
+    --argjson errors "$errors" \
+    --argjson keys "$keys" \
+    --argjson now "$now" \
+    --argjson sharePct "$sharePct" \
+    --argjson shares "$shares" \
+    --argjson midnight "$(utc_midnight_ms)" \
+    --arg slug "$SLUG" \
+    "$JQ_LIB"'
+    ($fillsdoc[0] // []) as $fills |
+    ($vault.performance // null) as $perf |
+    ($account.marginSummary // null) as $ms |
+    (if $ms then ($ms.accountValue | tonumber) else ($perf.accountValue // 0) end) as $value |
+    (if $ms then ($ms.totalMarginUsed | tonumber) else 0 end) as $used |
+    (if $account and $account.withdrawable then ($account.withdrawable | tonumber) else ($value - $used) end) as $free |
+    ([ $fills[] | select(.time >= $midnight)
+       | ((.closedPnl // "0") | tonumber) - ((.fee // "0") | tonumber) ] | add // 0) as $todayLive |
+    ($daily // [] | map(select(type == "object")) | map({
+        day, cycleCount: (.cycleCount // 0), fillCount: (.fillCount // 0),
+        realized: ((.realized // 0) * $sharePct),
+        fees: ((.fees // 0) * $sharePct),
+        netRealized: ((.netRealized // 0) * $sharePct) })
+      | sort_by(.day)) as $rows |
+    ($perf.updatedAt // null) as $updatedAt |
+    (if $updatedAt then (($now - ($updatedAt / 1000)) | floor) else null end) as $syncAge |
+    {
+      ok: true, demo: false, slug: $slug,
+      label: ($vault.label // "Hawk"),
+      leverage: ($vault.leverage // null),
+      errors: $errors,
+      vault: {
+        paused: ($perf.paused // false),
+        cycles: ($perf.cycles // 0),
+        activeCoins: ($perf.activeCoins // 0),
+        realizedSinceReset: ($perf.realizedPnl // 0),
+        realizedSinceResetText: (($perf.realizedPnl // 0) | signed),
+        returnPct: ($perf.returnPct // null),
+        totalDeposits: ($perf.totalDeposits // null),
+        navPerShare: ($vault.depositorStats.navPerShare // null),
+        shares: $shares, sharePct: $sharePct,
+        sharePctText: (($sharePct * 100 * 100 | round) / 100 | tostring) + "%",
+        syncAgeSec: $syncAge,
+        stale: (if $syncAge == null then true else $syncAge > 900 end)
+      },
+      account: {
+        live: ($ms != null),
+        value: $value, valueText: ($value | money), valueWhole: ($value | whole),
+        marginUsed: $used,
+        marginPct: (if $value > 0 then (($used / $value) * 1000 | round) / 10 else 0 end),
+        free: $free, freeText: ($free | whole),
+        positions: ([ $account.assetPositions[]? | .position
+          | select((.szi | tonumber) != 0)
+          | { coin,
+              size: (.szi | tonumber),
+              entry: (.entryPx | tonumber),
+              value: ((.positionValue // "0") | tonumber),
+              unrealized: ((.unrealizedPnl // "0") | tonumber),
+              unrealizedText: ((.unrealizedPnl // "0") | tonumber | signed),
+              roe: (((.returnOnEquity // "0") | tonumber) * 100) } ]
+          | sort_by(-.value))
+      },
+      today: { live: $todayLive, liveText: ($todayLive | signed),
+               fills: ([$fills[] | select(.time >= $midnight)] | length) },
+      newExits: $newExits,
+      daily: {
+        days: '"$DAYS"',
+        todayKey: $keys.today,
+        rows: $rows,
+        maxAbs: ([$rows[] | .netRealized | if . < 0 then -. else . end] | max // 0),
+        windows: (rollups($rows; $keys.today; $keys.y1; $keys.y2; $keys.c7; $keys.c15; $keys.c30) | withText),
+        record: (record($rows) | . + {gainText: (.gain | signed), lossText: (.loss | signed)})
+      },
+      barText: ($value | whole) + " " + ($todayLive | signed)
+    }'
+}
+
+# --- nav ---------------------------------------------------------------------
+
+cmd_nav() {
+  local range="${1:-7d}"
+  valid_range "$range" || die "range must be one of 1d 7d 15d 30d 60d 90d all"
+  if demo_on; then demo_nav "$range"; return; fi
+
+  local vault shares="0"
+  if vault="$(convex_query "vaults:getVaultPublicView" "$(jq -nc --arg s "$SLUG" '{slug: $s}')")" && [[ "$vault" != "null" ]]; then
+    shares="$(jq -r '.depositorStats.operatorShares // 0' <<<"$vault")"
+  fi
+  valid_number "$shares" || shares=0
+  local series
+  series="$(convex_query "vaults:getNavSeries" "$(jq -nc --arg s "$SLUG" --arg r "$range" '{slug: $s, range: $r}')")" ||
+    die "$(err_of "$series")"
+  jq -c --argjson shares "$shares" --argjson hwm "$HWM" --arg range "$range" "$JQ_LIB"'
+    [ .[] | select(type == "object") | {t: (.capturedAt / 1000 | floor), v: (.navPerShare * $shares)} ] as $pts |
+    { ok: true, range: $range, shares: $shares,
+      points: $pts,
+      count: ($pts | length),
+      min: ([$pts[].v] | min // 0), max: ([$pts[].v] | max // 0),
+      current: ($pts[-1].v // 0), currentText: ($pts[-1].v // 0 | money),
+      first: ($pts[0].v // 0),
+      hwm: ($hwm * $shares), hwmText: ($hwm * $shares | money),
+      hwmPerShare: $hwm }' <<<"$series"
+}
+
+# --- demo --------------------------------------------------------------------
+
+demo_summary() {
+  local now keys
+  now="$(date -u +%s)"
+  keys="$(day_keys "$now")"
+  jq -nc --argjson now "$now" --argjson keys "$keys" --arg slug "$SLUG" "$JQ_LIB"'
+    def key($d): ($now - $d * 86400) | strftime("%Y-%m-%d");
+    ([range(0; 70)] | map(
+        (. * 7919 % 97) as $r
+        | { day: key(69 - .),
+            netRealized: (if $r % 9 == 0 then -(($r % 23) + 3) elif $r % 11 == 0 then 0 else (($r % 13) + 0.7) end),
+            cycleCount: ($r % 9), fillCount: ($r % 17) })
+      | map(.realized = .netRealized + 0.15 | .fees = 0.15)) as $rows |
+    { ok: true, demo: true, slug: $slug, label: "Hawk", leverage: 3, errors: [],
+      vault: { paused: false, cycles: 332, activeCoins: 8, realizedSinceReset: 109.33,
+               realizedSinceResetText: (109.33 | signed), returnPct: 12.4, totalDeposits: 457.08,
+               navPerShare: 1.1234, shares: 568.53, sharePct: 0.9881, sharePctText: "98.81%",
+               syncAgeSec: 42, stale: false },
+      account: { live: true, value: 638.71, valueText: (638.71 | money), valueWhole: (638.71 | whole),
+                 marginUsed: 79.8, marginPct: 12.5, free: 251, freeText: (251 | whole),
+                 positions: [
+                   {coin: "ZRO", size: 46.8, entry: 1.0415, value: 49.4, unrealized: 0.65, unrealizedText: (0.65 | signed), roe: 3.9},
+                   {coin: "JUP", size: 221, entry: 0.2214, value: 48.9, unrealized: 0.21, unrealizedText: (0.21 | signed), roe: 1.2},
+                   {coin: "FIL", size: 61.4, entry: 0.7945, value: 48.8, unrealized: -0.18, unrealizedText: (-0.18 | signed), roe: -1.1},
+                   {coin: "CELO", size: 639, entry: 0.0763, value: 48.7, unrealized: -0.24, unrealizedText: (-0.24 | signed), roe: -1.5} ] },
+      today: { live: 4.12, liveText: (4.12 | signed), fills: 9 },
+      newExits: [],
+      daily: { days: 70, todayKey: $keys.today, rows: $rows,
+               maxAbs: ([$rows[] | .netRealized | if . < 0 then -. else . end] | max),
+               windows: (rollups($rows; $keys.today; $keys.y1; $keys.y2; $keys.c7; $keys.c15; $keys.c30) | withText),
+               record: (record($rows) | . + {gainText: (.gain | signed), lossText: (.loss | signed)}) },
+      barText: (638.71 | whole) + " " + (4.12 | signed) }'
+}
+
+demo_nav() {
+  local range="$1" now
+  now="$(date -u +%s)"
+  jq -nc --argjson now "$now" --arg range "$range" "$JQ_LIB"'
+    ({"1d": 1, "7d": 7, "15d": 15, "30d": 30, "60d": 60, "90d": 90, "all": 120}[$range]) as $days |
+    ([range(0; 168)] | map(
+        ($days * 86400 * . / 167) as $off
+        | { t: ($now - $days * 86400 + $off | floor),
+            v: (600 + 40 * ((. / 11 | sin)) + 12 * ((. / 3 | cos)) + . * 0.25) })) as $pts |
+    { ok: true, range: $range, shares: 568.53, points: $pts, count: ($pts | length),
+      min: ([$pts[].v] | min), max: ([$pts[].v] | max),
+      current: $pts[-1].v, currentText: ($pts[-1].v | money), first: $pts[0].v,
+      hwm: 568.53, hwmText: (568.53 | money), hwmPerShare: 1 }'
+}
+
+# --- commands ----------------------------------------------------------------
+
+case "${1:-status}" in
+status)
+  if demo_on; then
+    jq -n --arg slug "$SLUG" '{ok: true, demo: true, slug: $slug}'
+  elif v="$(convex_query "vaults:getVaultPublicView" "$(jq -nc --arg s "$SLUG" '{slug: $s}')")" && [[ "$v" != "null" ]]; then
+    jq -c --arg slug "$SLUG" '{ok: true, demo: false, slug: $slug, label: .label, live: .live, wallet: .policy.hlDepositAddress}' <<<"$v"
+  else
+    die "$( [[ "$v" == "null" ]] && echo "Vault slug not found" || err_of "$v" )"
+  fi
+  ;;
+summary) cmd_summary ;;
+nav) cmd_nav "${2:-7d}" ;;
+demo)
+  case "${2:-}" in
+  on)
+    private_dir "$CONFIG_DIR" || die "Could not use $CONFIG_DIR"
+    printf 'on\n' | write_private "$DEMO_FILE" || die "Could not write $DEMO_FILE"
+    jq -n '{ok: true, demo: true}'
+    ;;
+  off)
+    rm -f -- "$DEMO_FILE"
+    jq -n '{ok: true, demo: false}'
+    ;;
+  *) die "Usage: hawk-status demo on|off" ;;
+  esac
+  ;;
+*) die "Usage: hawk-status [status|summary|nav <range>|demo on|off]" ;;
+esac

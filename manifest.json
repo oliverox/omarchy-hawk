@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "oliverox.hawk",
+  "name": "Hawk",
+  "version": "0.1.0",
+  "author": "Oliver Oxenham",
+  "license": "MIT",
+  "description": "Your Hawk vault in the bar: account value and today's realized P&L, with the daily P&L calendar and position-value chart from the console in a click-open panel.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "Panel.qml" },
+  "barWidget": {
+    "displayName": "Hawk",
+    "description": "Account value and today's realized P&L, with the console's daily calendar and position-value chart in a panel.",
+    "category": "Apps",
+    "aliases": ["hawk", "vault", "hyperliquid"],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": { "slug": "hawk-2", "notify": true },
+    "schema": [
+      { "key": "slug", "type": "string", "label": "Vault slug", "defaultValue": "hawk-2" },
+      { "key": "notify", "type": "boolean", "label": "Toast on closing fills", "defaultValue": true }
+    ]
+  }
+}
