@@ -31,7 +31,7 @@ cat > "$FIX/vaults_getVaultPublicView.json" <<JSON
  "depositorStats":{"count":1,"totalShares":1000,"navPerShare":0.5,"operatorShares":500,"operatorSharePct":0.5}}
 JSON
 cat > "$FIX/clearinghouseState.json" <<'JSON'
-{"marginSummary":{"accountValue":"1234.5","totalMarginUsed":"123.45"},"withdrawable":"900.25",
+{"marginSummary":{"accountValue":"3234.5","totalMarginUsed":"323.45"},"withdrawable":"900.25",
  "assetPositions":[
   {"position":{"coin":"ZRO","szi":"46.8","entryPx":"1.04","positionValue":"49.4","unrealizedPnl":"0.6458","returnOnEquity":"0.039"}},
   {"position":{"coin":"OLD","szi":"0","entryPx":"1","positionValue":"0","unrealizedPnl":"0","returnOnEquity":"0"}},
@@ -79,14 +79,14 @@ echo "--- summary: shape and formatting"
 SUM=$("$SCRIPT" summary)
 assert_true "summary: ok" "$(jq -r .ok <<<"$SUM")"
 assert_eq "summary: no errors" "[]" "$(jq -c .errors <<<"$SUM")"
-assert_eq "summary: account value from Hyperliquid, not the vault view" "1234.5" "$(jq -r .account.value <<<"$SUM")"
-assert_eq "summary: whole-dollar text has thousands separator" "\$1,235" "$(jq -r .account.valueWhole <<<"$SUM")"
+assert_eq "summary: account value from Hyperliquid × share, not the vault view" "1617.25" "$(jq -r .account.value <<<"$SUM")"
+assert_eq "summary: whole-dollar text has thousands separator" "\$1,617" "$(jq -r .account.valueWhole <<<"$SUM")"
 assert_eq "summary: margin pct one decimal" "10" "$(jq -r .account.marginPct <<<"$SUM")"
-assert_eq "summary: free is withdrawable" "900.25" "$(jq -r .account.free <<<"$SUM")"
+assert_eq "summary: free is withdrawable × share" "450.125" "$(jq -r .account.free <<<"$SUM")"
 assert_eq "summary: zero-size positions dropped, sorted by value" "ZRO,FIL" "$(jq -r '[.account.positions[].coin] | join(",")' <<<"$SUM")"
-assert_eq "summary: today live = closedPnl - fee over today's fills" "1.91" "$(jq -r '.today.live | . * 100 | round / 100' <<<"$SUM")"
-assert_eq "summary: today live text" "+\$1.91" "$(jq -r .today.liveText <<<"$SUM")"
-assert_eq "summary: bar text" "\$1,235 +\$1.91" "$(jq -r .barText <<<"$SUM")"
+assert_eq "summary: today live = (closedPnl - fee over today's fills) × share" "0.96" "$(jq -r '.today.live | . * 100 | round / 100' <<<"$SUM")"
+assert_eq "summary: today live text" "+\$0.96" "$(jq -r .today.liveText <<<"$SUM")"
+assert_eq "summary: bar text" "\$1,617 +\$0.96" "$(jq -r .barText <<<"$SUM")"
 assert_eq "summary: share pct text" "50%" "$(jq -r .vault.sharePctText <<<"$SUM")"
 assert_eq "summary: sync not stale at 30s" "false" "$(jq -r .vault.stale <<<"$SUM")"
 assert_eq "summary: first look never announces old fills" "[]" "$(jq -c .newExits <<<"$SUM")"
@@ -121,9 +121,9 @@ jq --argjson t "$((LAST + 5000))" '. + [
   {"tid":8,"oid":34,"coin":"FIL","time":($t+2),"px":"0.80","sz":"10","closedPnl":"0","fee":"0.01"}]' \
   "$FIX/fills.json" > "$FIX/fills.tmp" && mv "$FIX/fills.tmp" "$FIX/fills.json"
 SUM2=$("$SCRIPT" summary)
-assert_eq "exits: one order = one toast, chunks summed net of fees" "1" "$(jq -r '.newExits | length' <<<"$SUM2")"
+assert_eq "exits: one order = one toast, chunks summed net of fees, × share" "1" "$(jq -r '.newExits | length' <<<"$SUM2")"
 assert_eq "exits: coin" "ZRO" "$(jq -r '.newExits[0].coin' <<<"$SUM2")"
-assert_eq "exits: pnl text" "+\$1.70" "$(jq -r '.newExits[0].pnlText' <<<"$SUM2")"
+assert_eq "exits: pnl text" "+\$0.85" "$(jq -r '.newExits[0].pnlText' <<<"$SUM2")"
 assert_eq "exits: an opening fill (closedPnl 0) is not an exit" "0" "$(jq -r '[.newExits[] | select(.coin=="FIL")] | length' <<<"$SUM2")"
 SUM3=$("$SCRIPT" summary)
 assert_eq "exits: announced once" "[]" "$(jq -c .newExits <<<"$SUM3")"
@@ -142,7 +142,7 @@ rm -f "$XDG_CACHE_HOME/omarchy-hawk/fills-seen.json"
 SUM4=$("$SCRIPT" summary)
 assert_eq "pagination: all 2005 fills counted" "2005" "$(jq -r .today.fills <<<"$SUM4")"
 assert_eq "pagination: walked two pages" "2" "$(grep -c userFillsByTime "$REQUEST_LOG")"
-assert_eq "pagination: live sum de-duplicated on tid" "20.05" "$(jq -r '.today.live | . * 100 | round / 100' <<<"$SUM4")"
+assert_eq "pagination: live sum de-duplicated on tid, × share" "10.03" "$(jq -r '.today.live | . * 100 | round / 100' <<<"$SUM4")"
 
 echo "--- nav"
 NAV=$("$SCRIPT" nav 7d)
@@ -160,9 +160,25 @@ assert_eq "unknown command refused" "false" "$("$SCRIPT" bogus | jq -r .ok)"
 mv "$FIX/clearinghouseState.json" "$FIX/clearinghouseState.json.off"
 SUM5=$("$SCRIPT" summary)
 assert_true "hl down: summary still ok from the vault view" "$(jq -r .ok <<<"$SUM5")"
-assert_eq "hl down: account falls back to the vault's value" "500" "$(jq -r .account.value <<<"$SUM5")"
+assert_eq "hl down: account falls back to the vault's value × share" "250" "$(jq -r .account.value <<<"$SUM5")"
 assert_eq "hl down: error carried" "1" "$(jq -r '[.errors[] | select(startswith("Hyperliquid"))] | length' <<<"$SUM5")"
 mv "$FIX/clearinghouseState.json.off" "$FIX/clearinghouseState.json"
+
+echo "--- hardening"
+touch "$FIX/huge_vaults_getNavSeries"
+BIG=$("$SCRIPT" nav 7d)
+rm -f "$FIX/huge_vaults_getNavSeries"
+assert_eq "oversized answer refused, not truncated" "false" "$(jq -r .ok <<<"$BIG")"
+assert_eq "oversized answer named" "true" "$(jq -r '.error | test("too large")' <<<"$BIG")"
+assert_eq "no work directories left behind" "0" "$(find "$XDG_CACHE_HOME/omarchy-hawk" -maxdepth 1 -name 'work.*' | wc -l)"
+echo "must survive" > "$WORK/victim"
+rm -f "$XDG_CACHE_HOME/omarchy-hawk/fills-seen.json"
+ln -s "$WORK/victim" "$XDG_CACHE_HOME/omarchy-hawk/fills-seen.json"
+"$SCRIPT" summary >/dev/null
+assert_eq "planted symlink on the seen file: target untouched" "must survive" "$(cat "$WORK/victim")"
+assert_eq "seen file replaced by a private regular file" "600 regular file" "$(stat -c '%a %F' "$XDG_CACHE_HOME/omarchy-hawk/fills-seen.json")"
+mkdir -p "$WORK/evil"; printf '#!/bin/sh\necho pwned\n' > "$WORK/evil/curl"; chmod +x "$WORK/evil/curl"
+assert_true "hostile PATH curl is not used" "$(PATH="$WORK/evil:$PATH" "$SCRIPT" status | jq -r .ok)"
 
 echo "--- demo"
 "$SCRIPT" demo on >/dev/null

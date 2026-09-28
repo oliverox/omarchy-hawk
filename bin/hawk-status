@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/usr/bin/bash
 
 # hawk-status: fetch what the Hawk console shows and print it as JSON for the
 # panel. All arithmetic on numbers that came over the network happens in jq,
@@ -12,7 +12,10 @@
 # Commands:
 #   status           whether the vault answers, and demo state
 #   summary          header figures, positions, live "today", daily P&L
-#                    calendar, new closing fills since the last look
+#                    calendar, new closing fills since the last look.
+#                    Every dollar figure is scaled by the operator's share of
+#                    the vault, so the header, the calendar, the toasts and
+#                    the nav chart all describe the same money
 #   nav <range>      position-value series: 1d 7d 15d 30d 60d 90d all
 #   demo on|off      invented data for screenshots; cache writes become no-ops
 #
@@ -21,14 +24,22 @@
 #   HAWK_WALLET       override the wallet the vault policy names
 #   HAWK_HWM          high-water mark per share for the chart line, default 1
 #   HAWK_DAYS         calendar days, default 70 (10 weeks)
-#   HAWK_CONVEX_BASE  Convex deployment URL (tests point it at a mock)
-#   HAWK_HL_BASE      Hyperliquid API URL (tests point it at a mock)
+#   HAWK_CONVEX_BASE  Convex deployment URL; only a loopback http:// mock is
+#   HAWK_HL_BASE      Hyperliquid API URL;     accepted in place of the default
 
 set -uo pipefail
+# Fixed PATH and byte semantics: no executable is looked up anywhere a same-user
+# process could prepend to, and ${#var} counts bytes.
+export PATH=/usr/bin
+export LC_ALL=C
 
 SLUG="${HAWK_SLUG:-hawk-2}"
-CONVEX_BASE="${HAWK_CONVEX_BASE:-https://dependable-snake-898.convex.cloud}"
-HL_BASE="${HAWK_HL_BASE:-https://api.hyperliquid.xyz}"
+CONVEX_BASE="https://dependable-snake-898.convex.cloud"
+HL_BASE="https://api.hyperliquid.xyz"
+# Tests run against a local mock; nothing else may replace the two origins.
+loopback_url() { [[ "$1" =~ ^http://127\.0\.0\.1:[0-9]{1,5}$ ]]; }
+if loopback_url "${HAWK_CONVEX_BASE:-}"; then CONVEX_BASE="$HAWK_CONVEX_BASE"; fi
+if loopback_url "${HAWK_HL_BASE:-}"; then HL_BASE="$HAWK_HL_BASE"; fi
 DAYS="${HAWK_DAYS:-70}"
 HWM="${HAWK_HWM:-1}"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-hawk"
@@ -39,6 +50,8 @@ SEEN_FILE="$CACHE_DIR/fills-seen.json"
 CURL_TIMEOUT=15
 MAX_RESPONSE_BYTES=4194304
 MAX_FILL_PAGES=10
+MAX_DAYS=400
+MAX_POINTS=2000
 
 die() {
   jq -n --arg error "$1" '{ok: false, error: $error}'
@@ -57,7 +70,7 @@ valid_slug() { [[ "$1" =~ ^[a-z0-9-]{1,40}$ ]]; }
 valid_wallet() { [[ "$1" =~ ^0x[0-9a-fA-F]{40}$ ]]; }
 valid_range() { [[ "$1" =~ ^(1d|7d|15d|30d|60d|90d|all)$ ]]; }
 valid_slug "$SLUG" || die "HAWK_SLUG must be lowercase letters, digits and dashes"
-valid_number "$DAYS" || DAYS=70
+[[ "$DAYS" =~ ^[0-9]{1,3}$ ]] && (( 10#$DAYS >= 1 && 10#$DAYS <= MAX_DAYS )) && DAYS=$((10#$DAYS)) || DAYS=70
 valid_number "$HWM" || HWM=1
 
 # --- private cache -----------------------------------------------------------
@@ -76,7 +89,7 @@ write_private() {
   tmp="$(mktemp "$dest.XXXXXX" 2>/dev/null)" || return 1
   chmod 600 -- "$tmp" 2>/dev/null
   cat >"$tmp" || { rm -f -- "$tmp"; return 1; }
-  mv -f -- "$tmp" "$dest" || { rm -f -- "$tmp"; return 1; }
+  mv -f -T -- "$tmp" "$dest" || { rm -f -- "$tmp"; return 1; }
 }
 
 read_bounded_file() {
@@ -89,6 +102,22 @@ demo_on() { [[ -f "$DEMO_FILE" && ! -L "$DEMO_FILE" ]]; }
 
 # --- talking to the two APIs -------------------------------------------------
 
+# One POST with bounds: curl -q first so ~/.curlrc adds nothing, https only
+# (loopback http for the test mock), no redirects, a deadline, and the body
+# capped at MAX_RESPONSE_BYTES + 1 so an oversized answer is refused rather
+# than silently cut. Prints body, newline, HTTP code; returns 2 when too large.
+post_json() {
+  local url="$1" body="$2" proto="=https" resp
+  [[ "$url" == http://127.0.0.1:* ]] && proto="=http"
+  resp="$(printf '%s' "$body" | curl -q -sS --proto "$proto" --proto-redir "$proto" \
+    --max-time "$CURL_TIMEOUT" --max-filesize "$MAX_RESPONSE_BYTES" --noproxy '*' \
+    -X POST -H "Content-Type: application/json" --data-binary @- \
+    -w '\n%{http_code}' -- "$url" 2>/dev/null | head -c $((MAX_RESPONSE_BYTES + 5)))"
+  # 63: curl stopped at --max-filesize, declared or while streaming.
+  [[ $? -ne 63 ]] && (( ${#resp} <= MAX_RESPONSE_BYTES + 4 )) || return 2
+  printf '%s' "$resp"
+}
+
 # One Convex query over its public HTTP API. Prints the `.value` on success;
 # on failure prints nothing and returns 1 with the reason on stderr-ish (a
 # global) so the caller can carry it in `errors`.
@@ -97,9 +126,8 @@ err_of() { jq -r '.error // "unknown error"' <<<"$1" 2>/dev/null; }
 convex_query() {
   local path="$1" args="$2" body resp code
   body="$(jq -nc --arg path "$path" --argjson args "$args" '{path: $path, args: $args, format: "json"}')"
-  resp="$(curl -sS --max-time "$CURL_TIMEOUT" -X POST "$CONVEX_BASE/api/query" \
-    -H "Content-Type: application/json" --data-binary "$body" -w '\n%{http_code}' 2>/dev/null |
-    head -c "$MAX_RESPONSE_BYTES")"
+  resp="$(post_json "$CONVEX_BASE/api/query" "$body")"
+  [[ $? -ne 2 ]] || { fail_doc "Convex $path: answer too large"; return 1; }
   code="${resp##*$'\n'}"
   resp="${resp%$'\n'*}"
   [[ "$code" == "200" ]] || { fail_doc "Convex $path: HTTP ${code:-none}"; return 1; }
@@ -112,9 +140,8 @@ convex_query() {
 
 hl_info() {
   local body="$1" resp code
-  resp="$(curl -sS --max-time "$CURL_TIMEOUT" -X POST "$HL_BASE/info" \
-    -H "Content-Type: application/json" --data-binary "$body" -w '\n%{http_code}' 2>/dev/null |
-    head -c "$MAX_RESPONSE_BYTES")"
+  resp="$(post_json "$HL_BASE/info" "$body")"
+  [[ $? -ne 2 ]] || { fail_doc "Hyperliquid: answer too large"; return 1; }
   code="${resp##*$'\n'}"
   resp="${resp%$'\n'*}"
   [[ "$code" == "200" ]] || { fail_doc "Hyperliquid: HTTP ${code:-none}"; return 1; }
@@ -129,8 +156,7 @@ fills_since() {
   local wallet="$1" start="$2" page n newest i dir
   # Pages go through files, never through an exec argument: a 2000-fill page
   # is ~250KB and a single argument tops out at 128KB on Linux.
-  dir="$(mktemp -d "${TMPDIR:-/tmp}/hawk-status-fills.XXXXXX")" || { printf '[]'; return 1; }
-  chmod 700 -- "$dir"
+  dir="$(work_dir)" || { fail_doc "Could not make a working directory"; return 1; }
   for i in $(seq -w 1 "$MAX_FILL_PAGES"); do
     page="$(hl_info "$(jq -nc --arg u "$wallet" --argjson s "$start" \
       '{type: "userFillsByTime", user: $u, startTime: $s}')")" || { rm -rf -- "$dir"; printf '%s' "$page"; return 1; }
@@ -146,6 +172,15 @@ fills_since() {
   jq -cs 'add // [] | unique_by(.tid)' "$dir"/p*.json 2>/dev/null || printf '[]'
   rm -rf -- "$dir"
   return 0
+}
+
+# Scratch space lives in the verified private cache directory, never in a
+# shared /tmp: an unpredictable directory made by mktemp inside it.
+work_dir() {
+  private_dir "$CACHE_DIR" || return 1
+  # A run killed outright leaves its directory behind; only our own, only here.
+  find "$CACHE_DIR" -mindepth 1 -maxdepth 1 -type d -name 'work.*' -mmin +30 -exec rm -rf -- {} + 2>/dev/null
+  mktemp -d -- "$CACHE_DIR/work.XXXXXXXX"
 }
 
 utc_midnight_ms() {
@@ -253,11 +288,11 @@ cmd_summary() {
       # First look ever: remember where we are, toast nothing (installing
       # the widget must not announce old money).
       if [[ "$latest" -gt 0 ]]; then
-        newExits="$(jq -c --argjson since "$latest" "$JQ_LIB"'
+        newExits="$(jq -c --argjson since "$latest" --argjson share "$sharePct" "$JQ_LIB"'
           [ .[] | select(.time > $since and ((.closedPnl // "0") | tonumber) != 0) ]
           | group_by(.coin, .oid)
           | map({ coin: .[0].coin,
-                  pnl: (map((.closedPnl | tonumber) - ((.fee // "0") | tonumber)) | add),
+                  pnl: ((map((.closedPnl | tonumber) - ((.fee // "0") | tonumber)) | add) * $share),
                   px: (.[0].px | tonumber),
                   time: (map(.time) | max) })
           | sort_by(.time)
@@ -286,10 +321,10 @@ cmd_summary() {
     return
   fi
 
-  local fillsfile
-  fillsfile="$(mktemp "${TMPDIR:-/tmp}/hawk-status-fills.XXXXXX")" || die "Could not make a working file"
+  WORK="$(work_dir)" || die "Could not make a working directory"
+  trap 'rm -rf -- "$WORK"' EXIT
+  local fillsfile="$WORK/fills.json"
   printf '%s' "$fills" > "$fillsfile"
-  trap "rm -f -- '$fillsfile'" EXIT
   jq -nc \
     --argjson vault "$vault" \
     --argjson account "$account" \
@@ -307,24 +342,28 @@ cmd_summary() {
     ($fillsdoc[0] // []) as $fills |
     ($vault.performance // null) as $perf |
     ($account.marginSummary // null) as $ms |
-    (if $ms then ($ms.accountValue | tonumber) else ($perf.accountValue // 0) end) as $value |
-    (if $ms then ($ms.totalMarginUsed | tonumber) else 0 end) as $used |
-    (if $account and $account.withdrawable then ($account.withdrawable | tonumber) else ($value - $used) end) as $free |
-    ([ $fills[] | select(.time >= $midnight)
-       | ((.closedPnl // "0") | tonumber) - ((.fee // "0") | tonumber) ] | add // 0) as $todayLive |
+    # The wallet holds the whole vault; the widget shows the operator share
+    # of it, the same scaling the calendar rows and the nav chart use.
+    def str($n): if type == "string" then .[0:$n] else "" end;
+    ((if $ms then ($ms.accountValue | tonumber) else ($perf.accountValue // 0) end) * $sharePct) as $value |
+    ((if $ms then ($ms.totalMarginUsed | tonumber) else 0 end) * $sharePct) as $used |
+    (if $account and $account.withdrawable then (($account.withdrawable | tonumber) * $sharePct) else ($value - $used) end) as $free |
+    (([ $fills[] | select(.time >= $midnight)
+       | ((.closedPnl // "0") | tonumber) - ((.fee // "0") | tonumber) ] | add // 0) * $sharePct) as $todayLive |
     ($daily // [] | map(select(type == "object")) | map({
         day, cycleCount: (.cycleCount // 0), fillCount: (.fillCount // 0),
         realized: ((.realized // 0) * $sharePct),
         fees: ((.fees // 0) * $sharePct),
         netRealized: ((.netRealized // 0) * $sharePct) })
-      | sort_by(.day)) as $rows |
+      | map(select(.day | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$")))
+      | sort_by(.day) | .[-('"$DAYS"' + 5):]) as $rows |
     ($perf.updatedAt // null) as $updatedAt |
     (if $updatedAt then (($now - ($updatedAt / 1000)) | floor) else null end) as $syncAge |
     {
       ok: true, demo: false, slug: $slug,
-      label: ($vault.label // "Hawk"),
+      label: ($vault.label // "Hawk" | str(60)),
       leverage: ($vault.leverage // null),
-      errors: $errors,
+      errors: ($errors | .[0:10] | map(str(200))),
       vault: {
         paused: ($perf.paused // false),
         cycles: ($perf.cycles // 0),
@@ -347,18 +386,18 @@ cmd_summary() {
         free: $free, freeText: ($free | whole),
         positions: ([ $account.assetPositions[]? | .position
           | select((.szi | tonumber) != 0)
-          | { coin,
+          | { coin: (.coin | str(20)),
               size: (.szi | tonumber),
               entry: (.entryPx | tonumber),
-              value: ((.positionValue // "0") | tonumber),
-              unrealized: ((.unrealizedPnl // "0") | tonumber),
-              unrealizedText: ((.unrealizedPnl // "0") | tonumber | signed),
+              value: (((.positionValue // "0") | tonumber) * $sharePct),
+              unrealized: (((.unrealizedPnl // "0") | tonumber) * $sharePct),
+              unrealizedText: (((.unrealizedPnl // "0") | tonumber) * $sharePct | signed),
               roe: (((.returnOnEquity // "0") | tonumber) * 100) } ]
-          | sort_by(-.value))
+          | sort_by(-.value) | .[0:50])
       },
       today: { live: $todayLive, liveText: ($todayLive | signed),
                fills: ([$fills[] | select(.time >= $midnight)] | length) },
-      newExits: $newExits,
+      newExits: ($newExits | .[0:20] | map(.coin |= str(20))),
       daily: {
         days: '"$DAYS"',
         todayKey: $keys.today,
@@ -387,7 +426,8 @@ cmd_nav() {
   series="$(convex_query "vaults:getNavSeries" "$(jq -nc --arg s "$SLUG" --arg r "$range" '{slug: $s, range: $r}')")" ||
     die "$(err_of "$series")"
   jq -c --argjson shares "$shares" --argjson hwm "$HWM" --arg range "$range" "$JQ_LIB"'
-    [ .[] | select(type == "object") | {t: (.capturedAt / 1000 | floor), v: (.navPerShare * $shares)} ] as $pts |
+    [ .[] | select(type == "object" and (.capturedAt | type) == "number" and (.navPerShare | type) == "number")
+      | {t: (.capturedAt / 1000 | floor), v: (.navPerShare * $shares)} ] | .[-'"$MAX_POINTS"':] as $pts |
     { ok: true, range: $range, shares: $shares,
       points: $pts,
       count: ($pts | length),

@@ -18,7 +18,9 @@ Nothing here needs a login, a key, or SSH. Three public sources:
 
 - **Hyperliquid's info API**, keyed by the vault's agent wallet address:
   account value, margin, open positions, and today's fills for the live
-  figure. Fills are paginated forward from UTC midnight and de-duplicated,
+  figure. The wallet holds the whole vault, so every dollar figure is scaled
+  by your share of it — the header, the position chips, the toasts, the
+  calendar and the chart all describe the same money. Fills are paginated forward from UTC midnight and de-duplicated,
   because a bare `userFills` call is a sliding 2000-fill window.
 - **The vault's public Convex query** (`vaults:getVaultPublicView`): label,
   leverage, paused, cycles, your share count and fraction, and the sync age.
@@ -74,14 +76,28 @@ HAWK_SLUG=hawk-1 bin/hawk-status summary
 
 `HAWK_WALLET` overrides the wallet the vault policy names, `HAWK_HWM` the
 high-water mark per share for the chart line (default 1), `HAWK_DAYS` the
-calendar length (default 70).
+calendar length (1–400 days, default 70). The two API origins are fixed;
+`HAWK_CONVEX_BASE` and `HAWK_HL_BASE` accept only a loopback `http://127.0.0.1:PORT`
+mock, which is what `tests/run` uses.
+
+The script runs `/usr/bin` tools only, with curl limited to HTTPS, no
+redirects, a 15 s timeout and a 4 MiB cap per answer (larger ones are refused,
+not cut). The panel kills it if it prints more than 256 KiB or runs past two
+minutes.
 
 ## Removing it
 
 ```bash
 omarchy plugin remove oliverox.hawk
-rm -rf ~/.cache/omarchy-hawk ~/.config/omarchy-hawk   # fill cursor + demo flag
 ```
+
+Two small directories stay behind, both 0700, and nothing else:
+
+- `~/.cache/omarchy-hawk/fills-seen.json`: the time of the newest fill already
+  toasted, so a reinstall doesn't announce old exits.
+- `~/.config/omarchy-hawk/demo`: only if you turned demo mode on.
+
+Delete those two files yourself if you want them gone.
 
 ## Tests
 
@@ -91,7 +107,10 @@ tests/run
 
 Runs the real script against a local mock of both APIs with fixture data:
 formatting, the calendar roll-ups, the win/loss record, fill pagination, the
-first-look toast silence, chart scaling, demo mode and input validation.
+first-look toast silence, chart scaling, demo mode and input validation, plus
+the hardening: an oversized streamed answer is refused, a symlink planted on the
+cache file is replaced rather than written through, and a `curl` early on `PATH`
+is never run.
 
 ## Licence
 

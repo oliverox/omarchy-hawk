@@ -73,8 +73,12 @@ Panel {
   property bool wasStale: false
   property bool wasPaused: false
 
-  function plain(value) {
-    return String(value || "").replace(/[<>]/g, "")
+  // For sinks the shell renders as rich text (tooltips, notification
+  // summary and body): no markup, no control or bidi characters, capped.
+  function plain(value, max) {
+    return String(value || "")
+      .replace(/[<>&\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, "")
+      .slice(0, max || 120)
   }
 
   readonly property bool paused: vault && vault.paused === true
@@ -108,7 +112,7 @@ Panel {
   function refreshNav() {
     if (navProc.running) return
     navLoading = true
-    navProc.command = [root.script, "nav", root.navRange]
+    navProc.command = ["/usr/bin/bash", root.script, "nav", root.navRange]
     navProc.running = true
   }
 
@@ -173,8 +177,8 @@ Panel {
   // shows them, with the plugin named so silencing applies.
   function toast(title, body, urgency) {
     var proc = notifyComponent.createObject(root, {
-      command: ["notify-send", "-a", "Hawk", "-u", urgency || "normal",
-                "-i", root.toastIcon, plain(title), plain(body)]
+      command: ["/usr/bin/notify-send", "-a", "Hawk", "-u", urgency || "normal",
+                "-i", root.toastIcon, "--", plain(title), plain(body)]
     })
     proc.running = true
   }
@@ -186,7 +190,7 @@ Panel {
   }
 
   function openDashboard() {
-    openProc.command = ["xdg-open", "https://hawkish.app/grid/dashboard"]
+    openProc.command = ["/usr/bin/xdg-open", "https://hawkish.app/grid/dashboard"]
     openProc.running = true
   }
 
@@ -199,29 +203,23 @@ Panel {
     }
   }
 
-  Process {
+  BoundedProcess {
     id: summaryProc
-    command: [root.script, "summary"]
+    command: ["/usr/bin/bash", root.script, "summary"]
     environment: ({ HAWK_SLUG: root.slug })
-    stdout: StdioCollector {
-      onStreamFinished: {
-        var payload
-        try { payload = JSON.parse(text) } catch (e) { payload = null }
-        root.applySummary(payload)
-      }
-    }
+    onDone: function(payload) { root.applySummary(payload) }
   }
 
-  Process {
+  BoundedProcess {
     id: navProc
+    timeoutMs: 60000
     environment: ({ HAWK_SLUG: root.slug })
-    stdout: StdioCollector {
-      onStreamFinished: {
-        var payload
-        try { payload = JSON.parse(text) } catch (e) { payload = null }
-        root.applyNav(payload)
-      }
-    }
+    onDone: function(payload) { root.applyNav(payload) }
+  }
+
+  Component.onDestruction: {
+    summaryProc.stop()
+    navProc.stop()
   }
 
   Process { id: openProc }
@@ -260,14 +258,14 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: root.barLabel
+    text: root.plain(root.barLabel, 60)
     labelVisible: false
     hasVisualContent: true
     foreground: root.attention ? root.urgent : (bar ? bar.barForeground : Color.foreground)
     dimmed: !root.loaded
     tooltipText: root.errorText !== ""
       ? root.plain(root.errorText)
-      : (root.loaded ? root.label + " · today " + root.plain(root.today.liveText || "") : "Hawk")
+      : (root.loaded ? root.plain(root.label, 60) + " · today " + root.plain(root.today.liveText || "", 30) : "Hawk")
     onPressed: function(b) { root.toggle() }
 
     Row {
@@ -376,7 +374,7 @@ Panel {
           Layout.fillWidth: true
           spacing: Style.space(18)
 
-          Stat { label: "ACCOUNT"; value: root.plain(root.account.valueText || "—"); big: true }
+          Stat { label: "YOUR ACCOUNT"; value: root.plain(root.account.valueText || "—"); big: true }
           Stat { label: "TODAY"; value: root.plain(root.today.liveText || "—")
                  tint: root.signColor(root.today.live); big: true }
           Stat { label: "MARGIN"; value: (root.account.marginPct !== undefined ? root.account.marginPct + "%" : "—") }

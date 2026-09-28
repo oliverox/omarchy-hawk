@@ -29,6 +29,20 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _huge(self):
+        # 6 MiB, chunked, no Content-Length: only a cap while reading stops it.
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        try:
+            chunk = b"[" + b" " * 65534 + b"\n"
+            for _ in range(96):
+                self.wfile.write(b"%x\r\n" % len(chunk) + chunk + b"\r\n")
+            self.wfile.write(b"0\r\n\r\n")
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def do_POST(self):
         n = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(n).decode() if n else "{}"
@@ -41,6 +55,8 @@ class H(BaseHTTPRequestHandler):
                 f.write(json.dumps({"path": self.path, "body": body}) + "\n")
         if self.path == "/api/query":
             path = body.get("path", "")
+            if os.path.exists(os.path.join(FIXTURES, "huge_" + path.replace(":", "_"))):
+                return self._huge()
             name = path.replace(":", "_") + ".json"
             if os.path.exists(os.path.join(FIXTURES, name)):
                 return self._send(200, {"status": "success", "value": load(name)})
