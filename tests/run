@@ -12,6 +12,7 @@ assert_true() { [ "$2" = "true" ] && ok "$1" || fail "$1" "got '$2'"; }
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/hawk-status-test.XXXXXX")"
 trap 'rm -rf "$WORK"; [ -n "${MOCK_PID:-}" ] && kill "$MOCK_PID" 2>/dev/null' EXIT
 export XDG_CACHE_HOME="$WORK/cache" XDG_CONFIG_HOME="$WORK/config"
+export TMPDIR="$WORK/tmp"; mkdir -p "$TMPDIR"
 export REQUEST_LOG="$WORK/requests.log"
 FIX="$WORK/fixtures"; mkdir -p "$FIX"
 export FIXTURE_DIR="$FIX"
@@ -170,7 +171,14 @@ BIG=$("$SCRIPT" nav 7d)
 rm -f "$FIX/huge_vaults_getNavSeries"
 assert_eq "oversized answer refused, not truncated" "false" "$(jq -r .ok <<<"$BIG")"
 assert_eq "oversized answer named" "true" "$(jq -r '.error | test("too large")' <<<"$BIG")"
-assert_eq "no work directories left behind" "0" "$(find "$XDG_CACHE_HOME/omarchy-hawk" -maxdepth 1 -name 'work.*' | wc -l)"
+assert_eq "no scratch directories left behind" "0" "$(find "$TMPDIR" -mindepth 1 -maxdepth 1 | wc -l)"
+# Nothing the script did not create is ever deleted, whatever its name or age.
+mkdir -p "$XDG_CACHE_HOME/omarchy-hawk/work.keep/inner" "$XDG_CONFIG_HOME/omarchy-hawk/notes"
+echo mine > "$XDG_CACHE_HOME/omarchy-hawk/work.keep/inner/file"
+echo mine > "$XDG_CONFIG_HOME/omarchy-hawk/notes/file"
+touch -d '2 hours ago' "$XDG_CACHE_HOME/omarchy-hawk/work.keep"
+"$SCRIPT" summary >/dev/null; "$SCRIPT" demo on >/dev/null; "$SCRIPT" demo off >/dev/null
+assert_eq "unrelated directories in cache and config survive" "mine mine" "$(cat "$XDG_CACHE_HOME/omarchy-hawk/work.keep/inner/file" "$XDG_CONFIG_HOME/omarchy-hawk/notes/file" | tr '\n' ' ' | sed 's/ $//')"
 echo "must survive" > "$WORK/victim"
 rm -f "$XDG_CACHE_HOME/omarchy-hawk/fills-seen.json"
 ln -s "$WORK/victim" "$XDG_CACHE_HOME/omarchy-hawk/fills-seen.json"

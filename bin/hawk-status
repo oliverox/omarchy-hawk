@@ -174,13 +174,11 @@ fills_since() {
   return 0
 }
 
-# Scratch space lives in the verified private cache directory, never in a
-# shared /tmp: an unpredictable directory made by mktemp inside it.
+# Scratch space: a fresh directory with an unpredictable name, mode 0700
+# from creation, removed by whoever made it. Nothing else is ever swept, so
+# no directory this run did not create can be deleted.
 work_dir() {
-  private_dir "$CACHE_DIR" || return 1
-  # A run killed outright leaves its directory behind; only our own, only here.
-  find "$CACHE_DIR" -mindepth 1 -maxdepth 1 -type d -name 'work.*' -mmin +30 -exec rm -rf -- {} + 2>/dev/null
-  mktemp -d -- "$CACHE_DIR/work.XXXXXXXX"
+  mktemp -d
 }
 
 utc_midnight_ms() {
